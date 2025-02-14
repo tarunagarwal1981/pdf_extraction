@@ -4,99 +4,114 @@ import pandas as pd
 import io
 from openai import OpenAI
 import json
+from typing import List, Dict
 
 st.title("Technical Documentation Data Extractor")
 
+# Initialize OpenAI client with secret
+client = OpenAI(api_key=st.secrets["api_key"])
+
 def extract_text_from_pdf(pdf_file):
+    """Extract text from uploaded PDF file"""
     pdf_reader = PyPDF2.PdfReader(pdf_file)
     text = ""
     for page in pdf_reader.pages:
         text += page.extract_text()
     return text
 
-def chunk_text(text, chunk_size=4000):
-    """Split text into chunks of approximately chunk_size characters"""
-    words = text.split()
+def chunk_text(text: str, chunk_size: int = 4000) -> List[str]:
+    """Split text into chunks, trying to maintain complete entries"""
+    # Split on double newlines to maintain entry boundaries
+    entries = text.split('\n\n')
     chunks = []
     current_chunk = []
     current_length = 0
     
-    for word in words:
-        if current_length + len(word) + 1 <= chunk_size:
-            current_chunk.append(word)
-            current_length += len(word) + 1
+    for entry in entries:
+        if current_length + len(entry) + 2 <= chunk_size:
+            current_chunk.append(entry)
+            current_length += len(entry) + 2
         else:
-            chunks.append(' '.join(current_chunk))
-            current_chunk = [word]
-            current_length = len(word)
+            if current_chunk:
+                chunks.append('\n\n'.join(current_chunk))
+            current_chunk = [entry]
+            current_length = len(entry)
     
     if current_chunk:
-        chunks.append(' '.join(current_chunk))
+        chunks.append('\n\n'.join(current_chunk))
     
     return chunks
 
-def process_chunk_with_llm(chunk, client):
+def process_chunk_with_llm(chunk: str, client: OpenAI) -> List[Dict]:
     """Process text chunk with GPT-3.5-turbo and extract structured data"""
-    # Clean and prepare the text
-    chunk = chunk.replace('\n', ' ').replace('\r', ' ')
-    while '  ' in chunk:
-        chunk = chunk.replace('  ', ' ')
-        
-    # Add debugging
-    st.text("Processing chunk starting with: " + chunk[:100] + "...")
-    system_prompt = """You are a technical documentation parser. You must extract data and return ONLY valid JSON with no additional text or explanation.
-
-FORMAT YOUR RESPONSE EXACTLY LIKE THIS, with no other text:
-[
-    {
-        "heading": "ACUXX_009904 Ch35,0099,Prop. Valve Test Set Poin->Suprv",
-        "description": "MBD Special test purposes only",
-        "cause": "MBD special test equipment not connected",
-        "effect": "No effect on engine",
-        "sugg_action": "No action required"
-    }
-]
-
-IMPORTANT RULES:
-1. Return ONLY the JSON array - no other text
-2. Each entry must have ALL fields: heading, description, cause, effect, sugg_action
-3. Skip entries missing any fields
-4. Ensure proper JSON formatting with correct commas and brackets
-5. Properly escape any special characters in text
-
-The input will contain technical documentation entries. Extract all complete entries following this format."""
+    system_prompt = """You are a technical documentation parser. Extract error codes and their details from the input text.
     
+    Example Input Format:
+    ACUXX_009904
+    Ch35,0099,Prop. Valve Test Set Poin->Suprv...
+    Description: MBD Special test purposes only
+    Cause: MBD special test equipment not connected
+    Effect: No effect on engine...
+    Sugg. Action: No action required...
+    
+    Return ONLY a JSON array with this EXACT structure:
+    [
+        {
+            "heading": "full error code and title",
+            "description": "content after Description:",
+            "cause": "content after Cause:",
+            "effect": "content after Effect:",
+            "sugg_action": "content after Sugg. Action:"
+        }
+    ]
+    
+    CRITICAL RULES:
+    1. Include the COMPLETE error code (e.g., ACUXX_009904) and full title in heading
+    2. Extract FULL text for each field, including multiline content
+    3. Keep line breaks/formatting in the content
+    4. Only extract entries that have ALL required fields
+    5. Return ONLY the JSON array - no other text
+    6. Ensure proper JSON escaping of special characters"""
+
     try:
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Extract structured data from this text: {chunk}"}
+                {"role": "user", "content": f"Extract data from:\n\n{chunk}"}
             ],
             temperature=0,
             max_tokens=2000,
             presence_penalty=0,
-            frequency_penalty=0,
+            frequency_penalty=0
         )
-        content = response.choices[0].message.content
-        # Debug the raw response
-        st.text("Raw LLM response:")
-        st.text(content)
+        
+        content = response.choices[0].message.content.strip()
+        
+        # Debug output in expander
+        with st.expander("Debug Information", expanded=False):
+            st.text("Chunk being processed:")
+            st.code(chunk[:500] + "..." if len(chunk) > 500 else chunk)
+            st.text("Raw LLM response:")
+            st.code(content)
         
         try:
-            # Try to parse the JSON response
             parsed_data = json.loads(content)
-            return parsed_data
+            # Validate required fields
+            validated_data = []
+            for entry in parsed_data:
+                if all(key in entry and entry[key] for key in ["heading", "description", "cause", "effect", "sugg_action"]):
+                    validated_data.append(entry)
+            return validated_data
         except json.JSONDecodeError as je:
             st.error(f"Invalid JSON in response: {str(je)}")
-            st.error("Raw response was:")
-            st.code(content)
             return []
+            
     except Exception as e:
         st.error(f"API Error: {str(e)}")
         return []
 
-def save_to_excel(data):
+def save_to_excel(data: List[Dict]) -> bytes:
     """Convert extracted data to Excel file"""
     df = pd.DataFrame(data)
     output = io.BytesIO()
@@ -104,20 +119,15 @@ def save_to_excel(data):
         df.to_excel(writer, sheet_name='Extracted Data', index=False)
     return output.getvalue()
 
-def save_to_csv(data):
+def save_to_csv(data: List[Dict]) -> bytes:
     """Convert extracted data to CSV file"""
     df = pd.DataFrame(data)
     return df.to_csv(index=False).encode('utf-8')
 
-# API key input
-api_key = st.text_input("Enter your OpenAI API key", type="password")
-
 # File upload
 uploaded_file = st.file_uploader("Upload PDF file", type="pdf")
 
-if uploaded_file and api_key:
-    client = OpenAI(api_key=api_key)
-    
+if uploaded_file:
     # Process button
     if st.button("Process PDF"):
         with st.spinner("Processing PDF..."):
@@ -137,29 +147,34 @@ if uploaded_file and api_key:
                 progress_bar.progress((i + 1) / len(chunks))
             
             # Show preview of extracted data
-            st.write("Preview of extracted data:")
-            preview_df = pd.DataFrame(all_data)
-            st.dataframe(preview_df.head())
-            
-            # Download buttons
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                excel_data = save_to_excel(all_data)
-                st.download_button(
-                    label="Download Excel",
-                    data=excel_data,
-                    file_name="extracted_data.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            
-            with col2:
-                csv_data = save_to_csv(all_data)
-                st.download_button(
-                    label="Download CSV",
-                    data=csv_data,
-                    file_name="extracted_data.csv",
-                    mime="text/csv"
-                )
+            if all_data:
+                st.success(f"Successfully extracted {len(all_data)} entries!")
+                
+                st.subheader("Preview of extracted data:")
+                preview_df = pd.DataFrame(all_data)
+                st.dataframe(preview_df)
+                
+                # Download buttons
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    excel_data = save_to_excel(all_data)
+                    st.download_button(
+                        label="Download Excel",
+                        data=excel_data,
+                        file_name="extracted_data.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                with col2:
+                    csv_data = save_to_csv(all_data)
+                    st.download_button(
+                        label="Download CSV",
+                        data=csv_data,
+                        file_name="extracted_data.csv",
+                        mime="text/csv"
+                    )
+            else:
+                st.warning("No valid entries were extracted. Please check the debug information.")
 else:
-    st.info("Please upload a PDF file and enter your OpenAI API key to begin.")
+    st.info("Please upload a PDF file to begin.")
