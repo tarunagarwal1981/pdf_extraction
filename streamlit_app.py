@@ -19,108 +19,93 @@ def extract_text_from_pdf(pdf_file):
         text += page.extract_text()
     return text
 
-def chunk_text(text: str, max_chunk_size: int = 2000) -> List[str]:
-    """Split text into smaller chunks, ensuring we stay within token limits
+def clean_text(text: str) -> str:
+    """Clean and preprocess the text"""
+    # Remove excessive whitespace
+    text = ' '.join(text.split())
+    # Replace multiple newlines with single newline
+    text = '\n'.join(line.strip() for line in text.split('\n') if line.strip())
+    return text
+
+def chunk_text(text: str, max_chunk_size: int = 500) -> List[str]:
+    """Split text into very small chunks, processing one or few entries at a time"""
+    # Clean the text first
+    text = clean_text(text)
     
-    Args:
-        text: The input text to chunk
-        max_chunk_size: Maximum characters per chunk (default 2000 to stay well within token limits)
-    """
-    # First split by error code entries (ACUXX_)
-    entries = []
+    # Split by ACUXX_ entries
+    chunks = []
     current_entry = ""
     
     for line in text.split('\n'):
-        if line.strip().startswith('ACUXX_'):
+        if line.startswith('ACUXX_'):
             if current_entry:
-                entries.append(current_entry.strip())
+                # Only add if it looks like a complete entry
+                if all(marker in current_entry.lower() for marker in ['description:', 'cause:', 'effect:', 'sugg']):
+                    chunks.append(current_entry.strip())
             current_entry = line
         else:
             current_entry += '\n' + line
     
-    if current_entry:
-        entries.append(current_entry.strip())
+    # Add the last entry if it exists
+    if current_entry and all(marker in current_entry.lower() for marker in ['description:', 'cause:', 'effect:', 'sugg']):
+        chunks.append(current_entry.strip())
     
-    # Now group entries into chunks
-    chunks = []
-    current_chunk = []
-    current_size = 0
-    
-    for entry in entries:
-        entry_size = len(entry)
-        if current_size + entry_size > max_chunk_size and current_chunk:
-            chunks.append('\n\n'.join(current_chunk))
-            current_chunk = [entry]
-            current_size = entry_size
-        else:
-            current_chunk.append(entry)
-            current_size += entry_size
-    
-    if current_chunk:
-        chunks.append('\n\n'.join(current_chunk))
+    # Debug information
+    st.write(f"Found {len(chunks)} potential entries to process")
     
     return chunks
 
 def process_chunk_with_llm(chunk: str, client: OpenAI) -> List[Dict]:
     """Process text chunk with GPT-3.5-turbo and extract structured data"""
-    system_prompt = """You are a technical documentation parser. Extract error codes and their details from the input text.
-    
-    Example Input Format:
-    ACUXX_009904
-    Ch35,0099,Prop. Valve Test Set Poin->Suprv...
-    Description: MBD Special test purposes only
-    Cause: MBD special test equipment not connected
-    Effect: No effect on engine...
-    Sugg. Action: No action required...
-    
-    Return ONLY a JSON array with this EXACT structure:
-    [
-        {
-            "heading": "full error code and title",
-            "description": "content after Description:",
-            "cause": "content after Cause:",
-            "effect": "content after Effect:",
-            "sugg_action": "content after Sugg. Action:"
-        }
-    ]"""
+    # Shorter prompt to save tokens
+    system_prompt = """Extract technical documentation data into JSON. Format:
+    [{
+        "heading": "error code and title",
+        "description": "description content",
+        "cause": "cause content",
+        "effect": "effect content",
+        "sugg_action": "suggested action content"
+    }]"""
 
     try:
-        # Add chunk size debugging
-        with st.expander("Debug Information", expanded=False):
-            st.text(f"Processing chunk of size: {len(chunk)} characters")
-            st.text("First 500 characters of chunk:")
-            st.code(chunk[:500])
+        # Debug the chunk size
+        chunk_size = len(chunk)
+        if chunk_size > 1000:  # Warning if chunk is too large
+            st.warning(f"Large chunk detected ({chunk_size} chars). Processing may fail.")
         
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Extract data from:\n\n{chunk}"}
+                {"role": "user", "content": chunk}
             ],
             temperature=0,
-            max_tokens=1000,
-            presence_penalty=0,
-            frequency_penalty=0
+            max_tokens=500
         )
         
         content = response.choices[0].message.content.strip()
         
+        # Show processing details in expander
+        with st.expander(f"Processing details for chunk starting with: {chunk[:50]}...", expanded=False):
+            st.text(f"Chunk size: {chunk_size} characters")
+            st.text("Input chunk:")
+            st.code(chunk)
+            st.text("Raw response:")
+            st.code(content)
+        
         try:
             parsed_data = json.loads(content)
-            # Validate required fields
             validated_data = []
             for entry in parsed_data:
                 if all(key in entry and entry[key] for key in ["heading", "description", "cause", "effect", "sugg_action"]):
                     validated_data.append(entry)
             return validated_data
         except json.JSONDecodeError as je:
-            st.error(f"Invalid JSON in response: {str(je)}")
-            st.text("Raw response was:")
-            st.code(content)
+            st.error(f"JSON parsing error: {str(je)}")
             return []
             
     except Exception as e:
-        st.error(f"API Error: {str(e)}")
+        st.error(f"Processing error: {str(e)}")
         return []
 
 def save_to_excel(data: List[Dict]) -> bytes:
@@ -151,12 +136,20 @@ if uploaded_file:
             
             # Process each chunk and combine results
             all_data = []
+            total_chunks = len(chunks)
+            
+            st.write(f"Processing {total_chunks} entries...")
             progress_bar = st.progress(0)
             
             for i, chunk in enumerate(chunks):
                 chunk_data = process_chunk_with_llm(chunk, client)
-                all_data.extend(chunk_data)
-                progress_bar.progress((i + 1) / len(chunks))
+                if chunk_data:
+                    all_data.extend(chunk_data)
+                progress_bar.progress((i + 1) / total_chunks)
+                
+                # Add a small delay between API calls if needed
+                if i < total_chunks - 1:
+                    time.sleep(0.5)  # 500ms delay between calls
             
             # Show preview of extracted data
             if all_data:
