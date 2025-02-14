@@ -1,2 +1,5 @@
 streamlit
+PyPDF2
 pandas
+openai
+xlsxwriter
