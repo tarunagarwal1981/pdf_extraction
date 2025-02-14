@@ -19,23 +19,42 @@ def extract_text_from_pdf(pdf_file):
         text += page.extract_text()
     return text
 
-def chunk_text(text: str, chunk_size: int = 4000) -> List[str]:
-    """Split text into chunks, trying to maintain complete entries"""
-    # Split on double newlines to maintain entry boundaries
-    entries = text.split('\n\n')
+def chunk_text(text: str, max_chunk_size: int = 2000) -> List[str]:
+    """Split text into smaller chunks, ensuring we stay within token limits
+    
+    Args:
+        text: The input text to chunk
+        max_chunk_size: Maximum characters per chunk (default 2000 to stay well within token limits)
+    """
+    # First split by error code entries (ACUXX_)
+    entries = []
+    current_entry = ""
+    
+    for line in text.split('\n'):
+        if line.strip().startswith('ACUXX_'):
+            if current_entry:
+                entries.append(current_entry.strip())
+            current_entry = line
+        else:
+            current_entry += '\n' + line
+    
+    if current_entry:
+        entries.append(current_entry.strip())
+    
+    # Now group entries into chunks
     chunks = []
     current_chunk = []
-    current_length = 0
+    current_size = 0
     
     for entry in entries:
-        if current_length + len(entry) + 2 <= chunk_size:
-            current_chunk.append(entry)
-            current_length += len(entry) + 2
-        else:
-            if current_chunk:
-                chunks.append('\n\n'.join(current_chunk))
+        entry_size = len(entry)
+        if current_size + entry_size > max_chunk_size and current_chunk:
+            chunks.append('\n\n'.join(current_chunk))
             current_chunk = [entry]
-            current_length = len(entry)
+            current_size = entry_size
+        else:
+            current_chunk.append(entry)
+            current_size += entry_size
     
     if current_chunk:
         chunks.append('\n\n'.join(current_chunk))
@@ -63,17 +82,15 @@ def process_chunk_with_llm(chunk: str, client: OpenAI) -> List[Dict]:
             "effect": "content after Effect:",
             "sugg_action": "content after Sugg. Action:"
         }
-    ]
-    
-    CRITICAL RULES:
-    1. Include the COMPLETE error code (e.g., ACUXX_009904) and full title in heading
-    2. Extract FULL text for each field, including multiline content
-    3. Keep line breaks/formatting in the content
-    4. Only extract entries that have ALL required fields
-    5. Return ONLY the JSON array - no other text
-    6. Ensure proper JSON escaping of special characters"""
+    ]"""
 
     try:
+        # Add chunk size debugging
+        with st.expander("Debug Information", expanded=False):
+            st.text(f"Processing chunk of size: {len(chunk)} characters")
+            st.text("First 500 characters of chunk:")
+            st.code(chunk[:500])
+        
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -81,19 +98,12 @@ def process_chunk_with_llm(chunk: str, client: OpenAI) -> List[Dict]:
                 {"role": "user", "content": f"Extract data from:\n\n{chunk}"}
             ],
             temperature=0,
-            max_tokens=2000,
+            max_tokens=1000,
             presence_penalty=0,
             frequency_penalty=0
         )
         
         content = response.choices[0].message.content.strip()
-        
-        # Debug output in expander
-        with st.expander("Debug Information", expanded=False):
-            st.text("Chunk being processed:")
-            st.code(chunk[:500] + "..." if len(chunk) > 500 else chunk)
-            st.text("Raw LLM response:")
-            st.code(content)
         
         try:
             parsed_data = json.loads(content)
@@ -105,6 +115,8 @@ def process_chunk_with_llm(chunk: str, client: OpenAI) -> List[Dict]:
             return validated_data
         except json.JSONDecodeError as je:
             st.error(f"Invalid JSON in response: {str(je)}")
+            st.text("Raw response was:")
+            st.code(content)
             return []
             
     except Exception as e:
