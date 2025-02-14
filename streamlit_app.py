@@ -4,6 +4,8 @@ import pandas as pd
 import io
 from openai import OpenAI
 import json
+import time
+import re
 from typing import List, Dict
 
 st.title("Technical Documentation Data Extractor")
@@ -19,65 +21,52 @@ def extract_text_from_pdf(pdf_file):
         text += page.extract_text()
     return text
 
-def clean_text(text: str) -> str:
-    """Clean and preprocess the text"""
-    # Remove excessive whitespace
-    text = ' '.join(text.split())
-    # Replace multiple newlines with single newline
-    text = '\n'.join(line.strip() for line in text.split('\n') if line.strip())
-    return text
-
-def chunk_text(text: str, max_chunk_size: int = 500) -> List[str]:
-    """Split text into very small chunks, processing one or few entries at a time"""
-    # Clean the text first
-    text = clean_text(text)
+def extract_entries(text: str) -> List[str]:
+    """Extract individual ACUXX entries from text using regex"""
+    # Split text at ACUXX_ patterns
+    entries = re.split(r'(?=ACUXX_\d{6})', text)
     
-    # Split by ACUXX_ entries
-    chunks = []
-    current_entry = ""
-    
-    for line in text.split('\n'):
-        if line.startswith('ACUXX_'):
-            if current_entry:
-                # Only add if it looks like a complete entry
-                if all(marker in current_entry.lower() for marker in ['description:', 'cause:', 'effect:', 'sugg']):
-                    chunks.append(current_entry.strip())
-            current_entry = line
-        else:
-            current_entry += '\n' + line
-    
-    # Add the last entry if it exists
-    if current_entry and all(marker in current_entry.lower() for marker in ['description:', 'cause:', 'effect:', 'sugg']):
-        chunks.append(current_entry.strip())
+    # Filter out any entries that don't start with ACUXX_
+    entries = [entry.strip() for entry in entries if entry.strip().startswith('ACUXX_')]
     
     # Debug information
-    st.write(f"Found {len(chunks)} potential entries to process")
-    
-    return chunks
+    st.write(f"Found {len(entries)} potential entries")
+    return entries
 
-def process_chunk_with_llm(chunk: str, client: OpenAI) -> List[Dict]:
-    """Process text chunk with GPT-3.5-turbo and extract structured data"""
-    # Shorter prompt to save tokens
-    system_prompt = """Extract technical documentation data into JSON. Format:
+def clean_entry(entry: str) -> str:
+    """Clean and format a single entry"""
+    # Remove excessive whitespace and newlines
+    entry = re.sub(r'\s+', ' ', entry)
+    
+    # Add newlines before main sections for better formatting
+    sections = ['Description:', 'Cause:', 'Effect:', 'Sugg. Action:']
+    for section in sections:
+        entry = re.sub(f'({section})', r'\n\1', entry)
+    
+    return entry.strip()
+
+def process_single_entry(entry: str, client: OpenAI) -> List[Dict]:
+    """Process a single ACUXX entry"""
+    # Skip if entry is too long
+    if len(entry) > 2000:
+        st.warning(f"Entry too long ({len(entry)} chars), skipping...")
+        return []
+        
+    system_prompt = """Extract technical data into this exact JSON format:
     [{
-        "heading": "error code and title",
-        "description": "description content",
-        "cause": "cause content",
-        "effect": "effect content",
-        "sugg_action": "suggested action content"
+        "heading": "error code and full title",
+        "description": "text after Description:",
+        "cause": "text after Cause:",
+        "effect": "text after Effect:",
+        "sugg_action": "text after Sugg. Action:"
     }]"""
 
     try:
-        # Debug the chunk size
-        chunk_size = len(chunk)
-        if chunk_size > 1000:  # Warning if chunk is too large
-            st.warning(f"Large chunk detected ({chunk_size} chars). Processing may fail.")
-        
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": chunk}
+                {"role": "user", "content": entry}
             ],
             temperature=0,
             max_tokens=500
@@ -86,20 +75,20 @@ def process_chunk_with_llm(chunk: str, client: OpenAI) -> List[Dict]:
         content = response.choices[0].message.content.strip()
         
         # Show processing details in expander
-        with st.expander(f"Processing details for chunk starting with: {chunk[:50]}...", expanded=False):
-            st.text(f"Chunk size: {chunk_size} characters")
-            st.text("Input chunk:")
-            st.code(chunk)
+        with st.expander(f"Entry details: {entry[:50]}...", expanded=False):
+            st.text("Input entry:")
+            st.code(entry)
             st.text("Raw response:")
             st.code(content)
         
         try:
             parsed_data = json.loads(content)
             validated_data = []
-            for entry in parsed_data:
-                if all(key in entry and entry[key] for key in ["heading", "description", "cause", "effect", "sugg_action"]):
-                    validated_data.append(entry)
+            for item in parsed_data:
+                if all(key in item and item[key] for key in ["heading", "description", "cause", "effect", "sugg_action"]):
+                    validated_data.append(item)
             return validated_data
+            
         except json.JSONDecodeError as je:
             st.error(f"JSON parsing error: {str(je)}")
             return []
@@ -131,27 +120,32 @@ if uploaded_file:
             # Extract text from PDF
             text = extract_text_from_pdf(uploaded_file)
             
-            # Chunk the text
-            chunks = chunk_text(text)
+            # Extract and clean individual entries
+            entries = extract_entries(text)
+            entries = [clean_entry(entry) for entry in entries]
             
-            # Process each chunk and combine results
+            # Process entries
             all_data = []
-            total_chunks = len(chunks)
+            total_entries = len(entries)
             
-            st.write(f"Processing {total_chunks} entries...")
+            st.write(f"Processing {total_entries} entries...")
             progress_bar = st.progress(0)
             
-            for i, chunk in enumerate(chunks):
-                chunk_data = process_chunk_with_llm(chunk, client)
-                if chunk_data:
-                    all_data.extend(chunk_data)
-                progress_bar.progress((i + 1) / total_chunks)
+            for i, entry in enumerate(entries):
+                # Skip empty or invalid entries
+                if not entry or not entry.startswith('ACUXX_'):
+                    continue
+                    
+                entry_data = process_single_entry(entry, client)
+                if entry_data:
+                    all_data.extend(entry_data)
+                progress_bar.progress((i + 1) / total_entries)
                 
-                # Add a small delay between API calls if needed
-                if i < total_chunks - 1:
-                    time.sleep(0.5)  # 500ms delay between calls
+                # Add a small delay between API calls
+                if i < total_entries - 1:
+                    time.sleep(0.5)
             
-            # Show preview of extracted data
+            # Show results
             if all_data:
                 st.success(f"Successfully extracted {len(all_data)} entries!")
                 
