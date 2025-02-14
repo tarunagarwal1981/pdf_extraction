@@ -41,21 +41,30 @@ def process_chunk_with_llm(chunk, client):
     chunk = chunk.replace('\n', ' ').replace('\r', ' ')
     while '  ' in chunk:
         chunk = chunk.replace('  ', ' ')
-    system_prompt = """You are a technical documentation parser. Extract data from the given text into JSON format.
-    Rules:
-    1. Look for entries that follow the pattern: error code/title followed by Description, Cause, Effect, and Suggested Action
-    2. Each entry should have all fields (heading, description, cause, effect, sugg_action)
-    3. Return the data in this exact JSON structure:
-    [{
-        "heading": "error code and title (e.g., ACUXX_009904)",
-        "description": "full description text",
-        "cause": "full cause text",
-        "effect": "full effect text",
-        "sugg_action": "full suggested action text"
-    }]
-    4. Ensure the JSON is properly formatted and all text values are properly escaped
-    5. Skip any incomplete entries where all fields are not present
-    6. Do not add any explanatory text - return only the JSON array"""
+        
+    # Add debugging
+    st.text("Processing chunk starting with: " + chunk[:100] + "...")
+    system_prompt = """You are a technical documentation parser. You must extract data and return ONLY valid JSON with no additional text or explanation.
+
+FORMAT YOUR RESPONSE EXACTLY LIKE THIS, with no other text:
+[
+    {
+        "heading": "ACUXX_009904 Ch35,0099,Prop. Valve Test Set Poin->Suprv",
+        "description": "MBD Special test purposes only",
+        "cause": "MBD special test equipment not connected",
+        "effect": "No effect on engine",
+        "sugg_action": "No action required"
+    }
+]
+
+IMPORTANT RULES:
+1. Return ONLY the JSON array - no other text
+2. Each entry must have ALL fields: heading, description, cause, effect, sugg_action
+3. Skip entries missing any fields
+4. Ensure proper JSON formatting with correct commas and brackets
+5. Properly escape any special characters in text
+
+The input will contain technical documentation entries. Extract all complete entries following this format."""
     
     try:
         response = client.chat.completions.create(
@@ -69,9 +78,22 @@ def process_chunk_with_llm(chunk, client):
             presence_penalty=0,
             frequency_penalty=0,
         )
-        return json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content
+        # Debug the raw response
+        st.text("Raw LLM response:")
+        st.text(content)
+        
+        try:
+            # Try to parse the JSON response
+            parsed_data = json.loads(content)
+            return parsed_data
+        except json.JSONDecodeError as je:
+            st.error(f"Invalid JSON in response: {str(je)}")
+            st.error("Raw response was:")
+            st.code(content)
+            return []
     except Exception as e:
-        st.error(f"Error processing chunk: {str(e)}")
+        st.error(f"API Error: {str(e)}")
         return []
 
 def save_to_excel(data):
