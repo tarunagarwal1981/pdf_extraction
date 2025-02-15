@@ -2,4 +2,5 @@ streamlit
 PyPDF2
 pandas
 openai
+anthropic
 xlsxwriter
