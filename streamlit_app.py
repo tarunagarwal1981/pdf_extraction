@@ -42,33 +42,32 @@ def process_with_openai(text, client):
     - description (full description text)
     - cause (full cause text)
     - effect (full effect text)
-    - sugg_action (full suggested action text)
+    - sugg_action (full suggested action text)"""
 
-    Example format:
-    [
-        {
-            "heading": "ACUXX_009904 Ch35,0099,Prop. Valve Test Set Poin->Suprv",
-            "description": "MBD Special test purposes only",
-            "cause": "MBD special test equipment not connected",
-            "effect": "No effect on engine",
-            "sugg_action": "No action required"
-        }
-    ]
-
-    Return ONLY the JSON array with no additional text. Ensure all entries have all required fields."""
-
+    # Split text into smaller chunks (approximately 4000 tokens)
+    max_chunk_length = 12000  # characters (approximate)
+    chunks = [text[i:i+max_chunk_length] for i in range(0, len(text), max_chunk_length)]
+    
+    all_results = []
     try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ],
-            temperature=0,
-            max_tokens=2000
-        )
-        content = response.choices[0].message.content
-        return json.loads(content)
+        for chunk in chunks:
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": chunk}
+                ],
+                temperature=0,
+                max_tokens=2000
+            )
+            content = response.choices[0].message.content
+            try:
+                results = json.loads(content)
+                all_results.extend(results)
+            except json.JSONDecodeError as e:
+                st.error(f"Error parsing OpenAI JSON response: {str(e)}")
+                continue
+        return all_results
     except Exception as e:
         st.error(f"OpenAI API Error: {str(e)}")
         return []
@@ -80,37 +79,27 @@ def process_with_anthropic(text, client):
     - description (full description text)
     - cause (full cause text)
     - effect (full effect text)
-    - sugg_action (full suggested action text)
-
-    Return the data in this exact format with no additional text:
-    [
-        {
-            "heading": "ACUXX_009904 Ch35,0099,Prop. Valve Test Set Poin->Suprv",
-            "description": "MBD Special test purposes only",
-            "cause": "MBD special test equipment not connected",
-            "effect": "No effect on engine",
-            "sugg_action": "No action required"
-        }
-    ]"""
+    - sugg_action (full suggested action text)"""
 
     try:
         response = client.messages.create(
             model="claude-3-opus-20240229",
             max_tokens=2000,
             temperature=0,
+            system=system_prompt,
             messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
                 {
                     "role": "user",
                     "content": text
                 }
             ]
         )
-        content = response.content[0].text
-        return json.loads(content)
+        try:
+            content = response.content[0].text
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            st.error(f"Error parsing Anthropic JSON response: {str(e)}")
+            return []
     except Exception as e:
         st.error(f"Anthropic API Error: {str(e)}")
         return []
@@ -162,7 +151,8 @@ if uploaded_file:
                 else:
                     chunk_data = process_with_anthropic(entry, anthropic_client)
                 
-                all_data.extend(chunk_data)
+                if isinstance(chunk_data, list):
+                    all_data.extend(chunk_data)
                 progress_bar.progress((i + 1) / len(entries))
             
             # Show preview of extracted data
